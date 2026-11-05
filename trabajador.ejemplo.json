@@ -1,0 +1,7 @@
+{
+  "clave_publica": "sb_publishable_AXnicGWc6hWdXOjiZ2-d9g_2j2tyBHy",
+  "agente_id": "PEGA-AQUI-EL-ID-DEL-AGENTE",
+  "llave": "PEGA-AQUI-LA-LLAVE",
+  "max_tareas_dia": 10,
+  "horario": {"desde": "00:00", "hasta": "23:59"}
+}
