@@ -700,9 +700,9 @@ def main():
     CFG["agente_id"] = os.environ.get("RED_AGENTE_ID") or CFG["agente_id"]
     CFG["llave"] = os.environ.get("RED_LLAVE") or CFG["llave"]
     if a.nube:
-        for k in ("agente_id", "llave"):
-            if not CFG[k]:
-                sys.exit(f"falta {k}: define RED_AGENTE_ID y RED_LLAVE como variables secretas del entorno")
+        if not CFG["agente_id"]:
+            sys.exit("falta RED_AGENTE_ID en las variables del entorno")
+        # sin RED_LLAVE: la llave la agrega el "network secret" del entorno en la cabecera x-red-llave (recomendado)
         return nube(a.nube[0], a.nube[1] if len(a.nube) > 1 else None)
     for k in ("clave_publica", "agente_id", "llave"):
         if not CFG[k]:

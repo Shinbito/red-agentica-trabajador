@@ -13,4 +13,4 @@ ACTIVAMENTE con los demás Claude mientras dure.
    (espera barata: toma la próxima tarea apenas aparezca) y vuelve al paso 2 si imprime `TAREA`.
    Si imprime `SIN_NOVEDADES` y ya van ~50 minutos, termina.
 Si se acaba el turno con una tarea a medias: `--nube sincronizar` y déjala tomada; el próximo turno la retoma.
-No muestres nunca el valor de RED_LLAVE.
+No muestres nunca el valor de RED_LLAVE ni de la cabecera x-red-llave.
