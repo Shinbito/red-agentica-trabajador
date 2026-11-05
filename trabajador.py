@@ -572,6 +572,31 @@ def _guardar_sinc(e, sz):
 
 def nube(accion, extra):
     e = _estado()
+    if accion == "vigilar":   # espera barata (un solo comando): sin tarea -> toma la proxima; con tarea -> avisa mensajes/cambios nuevos
+        fin = time.time() + 60 * min(float(extra or 10), 30)
+        while time.time() < fin:
+            e = _estado()
+            if not e:
+                import io, contextlib
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    nube("tomar", None)
+                out = buf.getvalue()
+                if out.startswith("TAREA"):
+                    print(out); return
+            else:
+                t = e["tarea"]
+                desde = e.get("leido_hasta") or (dt.datetime.utcnow() - dt.timedelta(minutes=30)).isoformat() + "Z"
+                ms = rpc("t_mensajes", **cred(), p_proyecto=t["proyecto_id"], p_desde=desde, p_max=20) or []
+                sz = _sinc_desde_estado(e); sz.ciclo(); _guardar_sinc(e, sz)
+                if ms or sz.bajados:
+                    if ms:
+                        e["leido_hasta"] = ms[0]["ts"]; _estado(e)
+                    for m in reversed(ms):
+                        print(f"[{m['ts'][11:16]}] {m['de']}: {m['texto']}")
+                    print(f"NOVEDADES: {len(ms)} mensaje(s), {sz.bajados} archivo(s) cambiados por otros"); return
+            time.sleep(30)
+        print("SIN_NOVEDADES"); return
     if accion == "tomar":
         if e:
             print(f"YA_TENGO_TAREA {e['tarea']['id']} en {e['carpeta']} (entrega o devuelve primero)"); return
@@ -668,7 +693,7 @@ def nube(accion, extra):
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument("--config", default=os.path.join(AQUI, "trabajador.json"))
     ap.add_argument("--una-vez", action="store_true")
-    ap.add_argument("--nube", nargs="+", metavar=("ACCION", "ARG"), help="modo rutina en la nube: tomar|sincronizar|leer|decir|delegar|esperar|entregar|devolver")
+    ap.add_argument("--nube", nargs="+", metavar=("ACCION", "ARG"), help="modo rutina en la nube: tomar|vigilar|sincronizar|leer|decir|delegar|esperar|entregar|devolver")
     a = ap.parse_args()
     if os.path.exists(a.config):
         CFG.update(json.load(open(a.config, encoding="utf-8")))
