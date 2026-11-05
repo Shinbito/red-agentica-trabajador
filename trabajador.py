@@ -492,6 +492,56 @@ def hacer(t):
     return "ok"
 
 
+BANDEJA = os.path.join(AQUI, "bandeja.json")
+
+
+def responder_bandeja():
+    """Contesta los mensajes dirigidos a este agente (chat directo desde la pagina), aunque no tenga tarea."""
+    estado = json.load(open(BANDEJA, encoding="utf-8")) if os.path.exists(BANDEJA) else {}
+    if time.time() < estado.get("pausa_hasta", 0):
+        return 0                                   # en limite de uso: reintenta mas tarde (el aviso ya se mando)
+    desde = estado.get("desde") or (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=10)).isoformat()
+    try:
+        msgs = rpc("t_bandeja", **cred(), p_desde=desde) or []
+    except Exception as e:
+        anotar("bandeja no disponible:", e); return 0
+    guardar = lambda: json.dump(estado, open(BANDEJA, "w", encoding="utf-8"))
+    for m in msgs:
+        carpeta = os.path.join(CFG["carpeta_trabajo"], "_chat"); os.makedirs(carpeta, exist_ok=True)
+        prompt = (f"Eres un agente de la Red agentica. {m['de']} te escribio directamente"
+                  f"{' en el proyecto ' + m['proyecto'] if m.get('proyecto') else ''}: «{m['texto']}». "
+                  "Responde breve, claro y en espanol chileno. Si te pide trabajo de codigo, explica que lo haras si lo crea como "
+                  "tarea o mision en la mesa del proyecto (o si te nombra orquestador), y propone como dividirlo. "
+                  "Responde SOLO con el texto del mensaje.")
+        try:
+            r = subprocess.run(["claude", "-p", prompt, "--output-format", "json"], cwd=carpeta, capture_output=True,
+                               text=True, encoding="utf-8", errors="replace", timeout=300)
+            texto = (json.loads(r.stdout).get("result") or "").strip()
+        except Exception as e:
+            texto = ""; anotar("no pude responder:", e)
+        quien = m["de"].split(" (agente")[0]
+        if RE_LIMITE.search(texto) or not texto:
+            # no marca el mensaje como leido: lo contesta de verdad cuando se libere el limite; avisa UNA vez por mensaje
+            if m["id"] not in estado.get("avisados", []):
+                rpc("t_mensaje", **cred(), p_proyecto=m.get("proyecto_id"),
+                    p_texto=f"@{quien}: ahora estoy en mi limite de uso; te contesto apenas se libere.", p_para=None)
+                estado["avisados"] = (estado.get("avisados", []) + [m["id"]])[-50:]
+            estado["pausa_hasta"] = time.time() + 1800; guardar()
+            anotar("bandeja: en limite de uso, reintento en 30 min"); return 0
+        rpc("t_mensaje", **cred(), p_proyecto=m.get("proyecto_id"), p_texto=f"@{quien}: {texto}"[:4000], p_para=None)
+        estado["desde"] = m["ts"]; guardar()
+        anotar("respondi un mensaje directo de", quien)
+    return len(msgs)
+
+
+def dormir_atento(segundos):
+    """Espera, pero cada 30 s revisa si alguien le escribio al agente y le contesta."""
+    fin = time.time() + segundos
+    while time.time() < fin:
+        responder_bandeja()
+        time.sleep(min(30, max(1, fin - time.time())))
+
+
 def uso_semanal_local():
     """Tokens usados por ESTA cuenta de Claude Code en los ultimos 7 dias, leidos de sus registros locales
     (~/.claude*/projects/**/*.jsonl). Es una estimacion: Claude no informa el % de cuota que queda."""
@@ -720,13 +770,14 @@ def main():
         if not activo or not en_horario() or hechas >= CFG["max_tareas_dia"]:
             if a.una_vez: return
             anotar("en pausa / fuera de horario / cupo del dia usado"); time.sleep(CFG["espera_sin_tareas_s"]); continue
+        responder_bandeja()
         if cuota_baja():
             if a.una_vez: return
             time.sleep(CFG["espera_sin_tareas_s"]); continue
         t = rpc("t_tomar", **cred(), p_minutos=CFG["minutos_por_tarea"])
         if not t or not t.get("id"):
             if a.una_vez: return
-            time.sleep(CFG["espera_sin_tareas_s"]); continue
+            dormir_atento(CFG["espera_sin_tareas_s"]); continue
         r = hacer(t)
         hechas += r == "ok"
         if a.una_vez: return
