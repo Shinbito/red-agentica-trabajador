@@ -28,6 +28,21 @@ CFG = {
                     "--allowedTools", "Read,Edit,Write,Glob,Grep,Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(graphify query:*),Bash(graphify explain:*),Bash(graphify path:*)"],
 }
 RE_LIMITE = re.compile(r"usage limit|rate limit|limit reached|5-hour limit|weekly limit|limite de uso", re.I)
+LIMITE_HASTA = 0.0   # mientras Claude este en su limite de uso, el latido dice "limite_uso" (la pagina lo muestra "sin creditos")
+
+
+def est(estado):
+    return "limite_uso" if time.time() < LIMITE_HASTA else estado
+
+
+def marcar_limite():
+    """Claude respondio que llego a su limite de uso: avisar a la pagina hasta la proxima prueba."""
+    global LIMITE_HASTA
+    LIMITE_HASTA = time.time() + CFG["espera_limite_s"]
+    try:
+        rpc("t_latido", **cred(), p_estado="limite_uso")
+    except Exception as e:
+        anotar("latido (limite) fallo:", e)
 
 
 def anotar(*a):
@@ -62,13 +77,13 @@ class Latido(threading.Thread):
     def run(self):
         while not self.fin.wait(300):
             try:
-                if rpc("t_latido", **cred(), p_estado="trabajando") is False:
+                if rpc("t_latido", **cred(), p_estado=est("trabajando")) is False:
                     self.pausa = True
             except Exception as e:
                 anotar("latido fallo:", e)
 
 
-IGNORAR_DIRS = {".git", "graphify-out", "NOTAS", "node_modules", "__pycache__", ".venv", "venv", ".claude"}
+IGNORAR_DIRS = {".git", "graphify-out", "NOTAS", "ENTREGAS", "node_modules", "__pycache__", ".venv", "venv", ".claude"}
 IGNORAR_ARCH = {"TAREA.md", "RESULTADO.md", "MENSAJES.txt", "SUBTAREAS.json"}
 MAX_BYTES = 1_000_000
 
@@ -222,6 +237,79 @@ class Sincronizador(threading.Thread):
         anotar(f"codigo en vivo: {self.subidos} subidas, {self.bajados} bajadas, {len(self.conflictos)} conflictos")
 
 
+# ======================= SEGURO DEL ROADMAP =======================
+# Cada proyecto tiene un roadmap (alcance). En un proyecto AJENO (no eres creador ni orquestador) el agente revisa cada
+# pedido contra el roadmap antes de gastar el cupo de su dueno: si queda fuera o puede danar, lo rechaza, se pausa el
+# prestamo y se avisa (t_fuera_de_roadmap). Copia local del roadmap en roadmaps/<proyecto>.md (contexto para el prompt).
+ROADMAPS = os.path.join(AQUI, "roadmaps")
+
+
+def roadmap_de(proyecto_id):
+    """{roadmap, version, propio, aceptada, pausado, nombre} o None si no se pudo leer. Guarda copia local."""
+    if not proyecto_id:
+        return None
+    try:
+        rm = rpc("t_roadmap", **cred(), p_proyecto=proyecto_id)
+    except Exception as e:
+        anotar("no pude leer el roadmap:", e); return None
+    if rm and rm.get("roadmap"):
+        os.makedirs(ROADMAPS, exist_ok=True)
+        open(os.path.join(ROADMAPS, f"{proyecto_id}.md"), "w", encoding="utf-8").write(
+            f"<!-- {rm.get('nombre')} · version {rm.get('version')} -->\n{rm['roadmap']}\n")
+    return rm
+
+
+def seccion_roadmap(rm):
+    if not rm or not rm.get("roadmap"):
+        return ""
+    return (f"\n# Roadmap del proyecto (version {rm.get('version')}): es el LIMITE de tu trabajo\n{rm['roadmap']}\n"
+            "- Haz solo lo que avance este roadmap. Si algo de lo pedido queda fuera o podria danar el proyecto, a sus usuarios o "
+            "a terceros (robar datos o sesiones, borrar, meter puertas traseras, spam), NO lo hagas y explicalo en RESULTADO.md.\n")
+
+
+def revisar_pedido(proyecto_id, pedido, tarea_id=None, quien=None, rm=None):
+    """True si se puede trabajar. En proyecto ajeno pregunta a Claude (haiku) si el pedido esta dentro del roadmap y no es
+    danino; si no, llama t_fuera_de_roadmap (cancela la tarea, pausa el prestamo, avisa). None = no se pudo revisar."""
+    rm = rm or roadmap_de(proyecto_id)
+    if rm is None:
+        return None
+    if rm.get("propio"):
+        return True
+    def rechazar(motivo, danino=False):
+        try:
+            rpc("t_fuera_de_roadmap", **cred(), p_proyecto=proyecto_id, p_motivo=motivo[:2000], p_danino=danino,
+                p_tarea=tarea_id, p_quien=quien)
+        except Exception as e:
+            anotar("no pude avisar el rechazo:", e)
+        anotar("RECHAZADO (roadmap):", motivo[:200]); return False
+    if rm.get("pausado"):
+        return rechazar("el prestamo esta en pausa: el dueno del agente debe revisar el roadmap y reactivarlo")
+    if not rm.get("roadmap"):
+        return rechazar("el proyecto no tiene roadmap escrito: un agente prestado no trabaja sin alcance definido")
+    if rm.get("aceptada") != rm.get("version"):
+        return rechazar(f"el roadmap cambio (version {rm.get('version')}) y el dueno del agente aun no lo acepta")
+    prompt = ("Eres el filtro de seguridad de un agente de IA prestado a un proyecto ajeno. Decide si el PEDIDO cabe dentro del "
+              "ROADMAP del proyecto y si podria ser danino (robar credenciales, datos o sesiones, borrar o sabotear, puertas traseras, "
+              "spam, danar a terceros, saltarse permisos). Ante la duda razonable sobre dano, marca danino. Proponer ideas o cambios al roadmap para que se voten esta dentro. Pedidos de coordinacion, "
+              "preguntas o tareas pequenas que claramente apoyan el roadmap estan dentro.\n\n"
+              f"# ROADMAP\n{rm['roadmap'][:12000]}\n\n# PEDIDO\n{pedido[:12000]}\n\n"
+              'Responde SOLO con JSON en una linea: {"dentro": true|false, "danino": true|false, "motivo": "frase corta en espanol"}')
+    vacia = os.path.join(AQUI, "_filtro"); os.makedirs(vacia, exist_ok=True)   # sin herramientas y en carpeta vacia: nada que filtrar
+    try:
+        r = subprocess.run(["claude", "-p", prompt, "--model", "haiku", "--output-format", "json", "--disallowedTools",
+                            "Bash,Read,Edit,Write,Glob,Grep,NotebookEdit,WebFetch,WebSearch,Task,Agent"],
+                           cwd=vacia, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
+        txt = json.loads(r.stdout).get("result") or ""
+        v = json.loads(re.search(r"\{.*\}", txt, re.S).group(0))
+    except Exception as e:
+        anotar("no pude revisar el pedido contra el roadmap:", e); return None
+    if v.get("danino"):
+        return rechazar(v.get("motivo") or "pedido posiblemente danino", True)
+    if not v.get("dentro"):
+        return rechazar(v.get("motivo") or "pedido fuera del roadmap")
+    return True
+
+
 def preparar_carpeta(t, proyecto_repo):
     base = os.path.join(CFG["carpeta_trabajo"], t["id"])
     shutil.rmtree(base, ignore_errors=True); os.makedirs(base)
@@ -253,6 +341,8 @@ Trabaja SOLO dentro de esta carpeta. No subas credenciales ni datos personales.
   (markdown, una idea por nota, enlaza otras notas con [[Nombre de la nota]]).
 
 # Como entregar
+- Si produces disenos, imagenes, animaciones, maquetas HTML, PDF o videos, dejalos en ENTREGAS/: aparecen en el espacio de
+  trabajo del proyecto.
 - Deja tu resultado final en RESULTADO.md (resumen claro de lo que hiciste, hallazgos y siguientes pasos).
 - Si quieres decirle algo al resto (coordinar, avisar un hallazgo, pedir algo), escribe una linea por mensaje en
   MENSAJES.txt. Formato: `todos: texto` o `<id_agente>: texto` para un agente en particular.
@@ -324,9 +414,26 @@ def subir_conocimiento(base, proyecto_id, notas_antes):
         anotar(f"conocimiento: {subidos} archivo(s) subidos")
 
 
-def ejecutar_claude(prompt, base, sesion=None):
+ESFUERZOS = ("low", "medium", "high", "xhigh", "max")
+
+
+def ajustes_modelo(proyecto_id=None):
+    """Argumentos --model/--effort que el dueno eligio en la pagina (ajuste del proyecto > del agente > el de la cuenta)."""
+    try:
+        aj = rpc("t_ajustes", **cred(), p_proyecto=proyecto_id) or {}
+    except Exception:
+        return []
+    args = []
+    if aj.get("modelo") and re.fullmatch(r"[a-z0-9.\-\[\]]{2,60}", aj["modelo"]):
+        args += ["--model", aj["modelo"]]
+    if aj.get("esfuerzo") in ESFUERZOS:
+        args += ["--effort", aj["esfuerzo"]]
+    return args
+
+
+def ejecutar_claude(prompt, base, sesion=None, proyecto_id=None):
     """Corre Claude Code sin pantalla. Devuelve dict con texto, sesion, tokens, costo, codigo, crudo."""
-    cmd = ["claude", "-p", prompt, "--output-format", "json", *CFG["claude_args"]]
+    cmd = ["claude", "-p", prompt, "--output-format", "json", *CFG["claude_args"], *ajustes_modelo(proyecto_id)]
     if sesion:
         cmd += ["--resume", sesion]
     try:
@@ -368,6 +475,36 @@ def ajuste_de_nota(t):
     f = filas[0]
     diff = "\n".join(difflib.unified_diff((f["antes"] or "").splitlines(), f["despues"].splitlines(), "antes", "despues", lineterm=""))
     return f"\n# Ajuste de la nota {ruta} (por {f['quien']}, {f['ts'][:16]})\n```diff\n{diff or f['despues']}\n```\n"
+
+
+def cambios_de_mesa(t):
+    """Si la mision viene de la MESA DE TRABAJO, arma la seccion con lo que cambio y como decidir (trabajar o llevar a votacion)."""
+    if not (t.get("config") or {}).get("mesa"):
+        return ""
+    try:
+        m = rpc("t_mesa", **cred(), p_proyecto=t["proyecto_id"], p_desde=int(t["config"].get("mesa_desde") or 0)) or {}
+    except Exception as e:
+        anotar("no pude leer la mesa de trabajo:", e); return ""
+    import difflib
+    diff = "\n".join(difflib.unified_diff((m.get("antes") or "").splitlines(), (m.get("texto") or "").splitlines(), "antes", "ahora", lineterm=""))
+    return f"""
+# Cambios en la mesa de trabajo (version {m.get('version')}, ultimo cambio de {m.get('quien') or '?'})
+La mesa de trabajo es el documento vivo del proyecto: las personas escriben con palabras que quieren. Incluye una seccion
+"## Roadmap" que es un BORRADOR: el roadmap oficial solo cambia votando.
+```diff
+{diff[:20000] or '(sin diferencias visibles)'}
+```
+## Como decidir
+- IMPORTANTE (cambia la direccion o el alcance, toca la seccion Roadmap, agrega una funcionalidad grande o afecta el trabajo de
+  los demas): NO lo implementes. Escribe PROPUESTA.md para que los miembros voten en el Foro, con este formato exacto:
+  # <titulo corto>
+  tipo: roadmap        (si toca la seccion Roadmap; el cuerpo es el ROADMAP COMPLETO nuevo)   o   tipo: nota
+  nota: Mesa de trabajo.md   (solo si es tipo nota)
+
+  <cuerpo en markdown: que se propone, por que, que cambia para el resto>
+- MENOR (aclaraciones, detalles, tareas chicas dentro del roadmap): trabajalo ahora (puedes delegar con SUBTAREAS.json).
+- En RESULTADO.md di que decidiste y por que.
+"""
 
 
 def prompt_modo(t, companeros):
@@ -417,6 +554,12 @@ def esperar_subtareas(t, ids, lat, max_min=45):
 
 
 def hacer(t):
+    rm = roadmap_de(t["proyecto_id"])
+    ok_rm = revisar_pedido(t["proyecto_id"], f"{t['titulo']}\n\n{t['descripcion']}", tarea_id=t["id"], rm=rm)
+    if ok_rm is False:
+        return "rechazada"
+    if ok_rm is None:
+        rpc("t_devolver", **cred(), p_tarea=t["id"], p_motivo="revision_roadmap"); anotar("no pude revisar el roadmap: devuelta"); return "pausa"
     repo = (t.get("config") or {}).get("repo_url")
     base = preparar_carpeta(t, repo)
     sinc = Sincronizador(base, t["proyecto_id"], t["id"])
@@ -449,11 +592,11 @@ def hacer(t):
     if sinc:
         sinc.start()
     anotar("trabajando en", t["titulo"], f"[{t.get('modo', 'trabajo')}]", "->", base)
-    prompt = armar_prompt(t, mensajes, [n for n in notas if n["ruta"].startswith("notas/")]) + ajuste_de_nota(t) + prompt_modo(t, companeros)
+    prompt = armar_prompt(t, mensajes, [n for n in notas if n["ruta"].startswith("notas/")]) + seccion_roadmap(rm) + ajuste_de_nota(t) + cambios_de_mesa(t) + prompt_modo(t, companeros)
     r, delegadas = None, []
     try:
         for ronda in range(6):                       # mision: planear -> delegar -> esperar -> integrar (hasta 6 rondas)
-            r = ejecutar_claude(prompt, base, r["sesion"] if r else None)
+            r = ejecutar_claude(prompt, base, r["sesion"] if r else None, t["proyecto_id"])
             registrar_consumo(t, r)
             if RE_LIMITE.search(r["crudo"]) or lat.pausa or t.get("modo") != "mision":
                 break
@@ -478,14 +621,20 @@ def hacer(t):
         if sinc:
             sinc.terminar()
     if RE_LIMITE.search(r["crudo"]) and not os.path.exists(os.path.join(base, "RESULTADO.md")):
-        rpc("t_devolver", **cred(), p_tarea=t["id"], p_motivo="limite_uso")
+        marcar_limite(); rpc("t_devolver", **cred(), p_tarea=t["id"], p_motivo="limite_uso")
         anotar("limite de uso: devuelta la tarea"); return "limite"
     if lat.pausa:
         rpc("t_devolver", **cred(), p_tarea=t["id"], p_motivo="pausa"); anotar("pausa pedida por el dueno"); return "pausa"
     n = publicar_mensajes(base, t["proyecto_id"])
     subir_conocimiento(base, t["proyecto_id"], {x["ruta"]: x["contenido"] for x in notas})
+    entregados = subir_entregas(base, t["proyecto_id"], tarea_id=t["id"])
+    propuesta = subir_propuesta(base, t["proyecto_id"])          # la mision decidio llevar el cambio a votacion
     f = os.path.join(base, "RESULTADO.md")
     resultado = open(f, encoding="utf-8", errors="replace").read() if os.path.exists(f) else r["texto"][-20000:]
+    if propuesta:
+        resultado += f"\n\n🗳️ Llevado al Foro para votar: «{propuesta}»"
+    if entregados:
+        resultado += "\n\n📎 Entregas: " + ", ".join(entregados)
     ok = r["codigo"] == 0 and os.path.exists(f)
     rpc("t_terminar", **cred(), p_tarea=t["id"], p_ok=ok, p_resultado=resultado)
     anotar("tarea", "hecha" if ok else "fallida", f"({n} mensajes, {len(delegadas)} delegadas, {r['tokens']} tokens ultima ronda)")
@@ -495,8 +644,122 @@ def hacer(t):
 BANDEJA = os.path.join(AQUI, "bandeja.json")
 
 
+ARCHIVOS = "https://srv1727399.hstgr.cloud/archivos"
+TIPOS_ENTREGA = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp",
+                 ".svg": "image/svg+xml", ".mp4": "video/mp4", ".webm": "video/webm", ".mov": "video/quicktime", ".mp3": "audio/mpeg",
+                 ".wav": "audio/wav", ".pdf": "application/pdf", ".html": "text/html", ".htm": "text/html", ".css": "text/css",
+                 ".md": "text/markdown", ".txt": "text/plain", ".json": "application/json", ".zip": "application/zip",
+                 ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                 ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                 ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", ".glb": "model/gltf-binary"}
+
+
+def subir_entregas(carpeta, proyecto_id, tarea_id=None, hilo_id=None, ya=None):
+    """Sube al espacio de trabajo (servidor de archivos del VPS) lo nuevo o cambiado en ENTREGAS/. Devuelve los nombres subidos."""
+    ya = ya if ya is not None else {}
+    d = os.path.join(carpeta, "ENTREGAS")
+    subidos = []
+    for raiz, _, archs in os.walk(d) if os.path.isdir(d) else []:
+        for a in sorted(archs):
+            f = os.path.join(raiz, a); rel = os.path.relpath(f, d).replace(os.sep, "/")
+            st = os.stat(f); firma_local = f"{st.st_size}:{int(st.st_mtime)}"
+            if ya.get(rel) == firma_local:
+                continue
+            tipo = TIPOS_ENTREGA.get(os.path.splitext(a)[1].lower(), "application/octet-stream")
+            q = urllib.parse.urlencode({k: v for k, v in dict(agente=CFG["agente_id"], proyecto=proyecto_id, nombre=rel.replace("/", "_"), tipo=tipo,
+                                                              tarea=tarea_id or "", hilo=hilo_id or "").items() if v})
+            req = urllib.request.Request(f"{ARCHIVOS}/subir?{q}", data=open(f, "rb").read(), method="POST",
+                                         headers={"Content-Type": "application/octet-stream", **({"x-red-llave": CFG["llave"]} if CFG["llave"] else {})})
+            try:
+                urllib.request.urlopen(req, timeout=300).read(); ya[rel] = firma_local; subidos.append(rel)
+            except Exception as e:
+                anotar("no pude subir la entrega", rel, e)
+    return subidos
+
+
+INSTR_PROPUESTA = ("\n\n# Cambios grandes se VOTAN\nSi la persona pide un cambio grande o de direccion del proyecto (\"quiero hacer este cambio...\", "
+                   "cambiar el roadmap, una funcionalidad nueva grande, cambiar prioridades), NO lo hagas directo: redactalo como propuesta en el "
+                   "archivo PROPUESTA.md con este formato exacto:\n# <titulo corto>\ntipo: nota   (o: tipo: roadmap)\nnota: <Nombre de la nota>.md   "
+                   "(solo si es nota; usa una existente si corresponde)\n\n<cuerpo completo en markdown>\n"
+                   "Si es roadmap, el cuerpo es el ROADMAP COMPLETO nuevo (parte del actual y aplica el cambio). Luego responde explicando "
+                   "en 2-3 lineas que quedo como propuesta para que los miembros la debatan y voten en Decisiones.")
+
+
+def subir_propuesta(carpeta, proyecto_id):
+    """Si Claude dejo PROPUESTA.md, la sube como propuesta (t_proponer). Devuelve el titulo o None."""
+    f = os.path.join(carpeta, "PROPUESTA.md")
+    if not os.path.exists(f):
+        return None
+    texto = open(f, encoding="utf-8", errors="replace").read(); os.remove(f)
+    if not proyecto_id:
+        return None
+    lineas = texto.strip().splitlines()
+    if not lineas:
+        return None
+    titulo = lineas[0].lstrip("# ").strip()[:200] or "Propuesta"
+    tipo, ruta, i = "nota", None, 1
+    while i < len(lineas) and (not lineas[i].strip() or re.match(r"^(tipo|nota)\s*:", lineas[i].strip(), re.I)):
+        k = lineas[i].strip()
+        if k.lower().startswith("tipo"):
+            tipo = "roadmap" if "roadmap" in k.lower() else "nota"
+        elif k.lower().startswith("nota"):
+            ruta = k.split(":", 1)[1].strip() or None
+        i += 1
+    cuerpo = "\n".join(lineas[i:]).strip()
+    if not cuerpo:
+        return None
+    if tipo == "nota" and not ruta:
+        ruta = re.sub(r'[\\/:*?"<>|#^\[\]]', "-", titulo)[:80] + ".md"
+    try:
+        rpc("t_proponer", **cred(), p_proyecto=proyecto_id, p_tipo=tipo, p_titulo=titulo, p_cuerpo=cuerpo,
+            p_ruta_nota=ruta if tipo == "nota" else None)
+        anotar("propuesta subida:", titulo); return titulo
+    except Exception as e:
+        anotar("no pude subir la propuesta:", e); return None
+
+
+# ---------- contexto de los chats (hilos) guardado en la base ----------
+# Cada mensaje de un hilo corre un `claude -p` NUEVO con: resumen del hilo + ultimos mensajes. Cuando se acumulan mas de
+# HILO_RESUMIR_DESDE mensajes sin resumir, los mas viejos se incorporan al resumen (haiku, sin herramientas) y se guarda en
+# Supabase (contexto_hilo). Asi el gasto por mensaje no crece sin fin y cualquier equipo del dueno puede retomar el hilo.
+HILO_RECIENTES, HILO_RESUMIR_DESDE = 8, 16
+
+
+def _haiku(prompt, timeout=300):
+    vacia = os.path.join(AQUI, "_filtro"); os.makedirs(vacia, exist_ok=True)
+    r = subprocess.run(["claude", "-p", prompt, "--model", "haiku", "--output-format", "json", "--disallowedTools",
+                        "Bash,Read,Edit,Write,Glob,Grep,NotebookEdit,WebFetch,WebSearch,Task,Agent"],
+                       cwd=vacia, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
+    return (json.loads(r.stdout).get("result") or "").strip()
+
+
+def contexto_de_hilo(hilo):
+    """Resumen + ultimos mensajes del hilo (sin el mensaje actual, que es el ultimo). Resume los viejos si hace falta."""
+    try:
+        c = rpc("t_hilo_contexto", **cred(), p_hilo=hilo, p_max=40) or {}
+    except Exception as e:
+        anotar("contexto del hilo no disponible:", e); return "", []
+    resumen, rec = c.get("resumen") or "", c.get("recientes") or []
+    if int(c.get("sin_resumir") or 0) > HILO_RESUMIR_DESDE and len(rec) > HILO_RECIENTES:
+        viejos, rec = rec[:-HILO_RECIENTES], rec[-HILO_RECIENTES:]
+        texto = "\n".join(f"{'AGENTE' if x['de_agente'] else 'PERSONA'}: {x['texto'][:3000]}" for x in viejos)
+        try:
+            nuevo = _haiku("Actualiza el RESUMEN de una conversacion de chat entre una persona y su agente de IA. Conserva lo importante "
+                           "para seguir la conversacion: objetivos, decisiones, datos, preferencias, archivos creados y pendientes. "
+                           "Maximo 400 palabras, en espanol, sin introduccion.\n\n"
+                           f"# Resumen anterior\n{resumen or '(vacio)'}\n\n# Mensajes nuevos a incorporar\n{texto}")
+            if nuevo:
+                rpc("t_hilo_resumir", **cred(), p_hilo=hilo, p_resumen=nuevo, p_hasta=viejos[-1]["ts"], p_cuantos=len(viejos))
+                resumen = nuevo; anotar(f"hilo {hilo[:8]}: resumi {len(viejos)} mensaje(s)")
+        except Exception as e:
+            anotar("no pude resumir el hilo:", e); rec = viejos[-4:] + rec   # sin resumen: al menos algo mas de contexto
+    return resumen, rec[:-1] if rec else []   # el ultimo es el mensaje que se esta respondiendo
+
+
 def responder_bandeja():
-    """Contesta los mensajes dirigidos a este agente (chat directo desde la pagina), aunque no tenga tarea."""
+    """Contesta los mensajes dirigidos a este agente: chat directo y CHAT CON HILOS (estilo Claude/ChatGPT) desde la pagina.
+    En un hilo recuerda la conversacion con el resumen guardado en la base (contexto_hilo) + los ultimos mensajes, en una
+    sesion nueva de Claude por mensaje; lo que deje en ENTREGAS/ aparece en el espacio de trabajo."""
     estado = json.load(open(BANDEJA, encoding="utf-8")) if os.path.exists(BANDEJA) else {}
     if time.time() < estado.get("pausa_hasta", 0):
         return 0                                   # en limite de uso: reintenta mas tarde (el aviso ya se mando)
@@ -507,39 +770,153 @@ def responder_bandeja():
         anotar("bandeja no disponible:", e); return 0
     guardar = lambda: json.dump(estado, open(BANDEJA, "w", encoding="utf-8"))
     for m in msgs:
-        carpeta = os.path.join(CFG["carpeta_trabajo"], "_chat"); os.makedirs(carpeta, exist_ok=True)
-        prompt = (f"Eres un agente de la Red agentica. {m['de']} te escribio directamente"
-                  f"{' en el proyecto ' + m['proyecto'] if m.get('proyecto') else ''}: «{m['texto']}». "
-                  "Responde breve, claro y en espanol chileno. Si te pide trabajo de codigo, explica que lo haras si lo crea como "
-                  "tarea o mision en la mesa del proyecto (o si te nombra orquestador), y propone como dividirlo. "
-                  "Responde SOLO con el texto del mensaje.")
+        hilo = m.get("hilo")
+        if not m.get("es_dueno"):              # modo participe: tu Claude solo atiende a su dueno
+            estado["desde"] = m["ts"]; guardar(); continue
+        rm = None
+        if m.get("proyecto_id") and not m.get("es_dueno"):     # el dueno hablando con su agente no necesita seguro
+            rm = roadmap_de(m["proyecto_id"])
+            ok_rm = revisar_pedido(m["proyecto_id"], m["texto"], rm=rm)
+            if ok_rm is not True:
+                aviso = ("Ese pedido queda fuera del roadmap del proyecto (o podría dañarlo): no lo hago. Mi dueño ya fue avisado."
+                         if ok_rm is False else "No pude revisar tu pedido contra el roadmap del proyecto; inténtalo más tarde.")
+                quien = m["de"].split(" (agente")[0]
+                try:
+                    if hilo:
+                        rpc("t_responder", **cred(), p_hilo=hilo, p_texto=aviso)
+                    else:
+                        rpc("t_mensaje", **cred(), p_proyecto=m.get("proyecto_id"), p_texto=f"@{quien}: {aviso}", p_para=None)
+                except Exception as e:
+                    anotar("no pude avisar:", e)
+                estado["desde"] = m["ts"]; guardar(); continue
+        elif m.get("proyecto_id"):
+            rm = roadmap_de(m["proyecto_id"])
+        carpeta = os.path.join(CFG["carpeta_trabajo"], "_chat", hilo or "directo"); os.makedirs(os.path.join(carpeta, "ENTREGAS"), exist_ok=True)
+        sesiones = estado.setdefault("sesiones", {}); vistos = estado.setdefault("entregas", {}).setdefault(hilo or "directo", {})
+        if hilo:
+            resumen, previos = contexto_de_hilo(hilo)
+            historia = (f"# Resumen de esta conversacion hasta ahora\n{resumen}\n\n" if resumen else "") + (
+                "# Ultimos mensajes\n" + "\n".join(f"{'Tu' if x['de_agente'] else m['de']}: {x['texto']}" for x in previos) + "\n\n" if previos else "")
+            prompt = (historia + f"# Mensaje nuevo de {m['de']}\n{m['texto']}\n\n---\n(Chat de la Red agentica, proyecto «{m.get('proyecto') or '-'}», te escribe {m['de']}. "
+                      "Responde como en un chat. Si te piden un diseno, imagen, animacion, maqueta, PDF, presentacion o video, CREALO y "
+                      "guarda el resultado en la carpeta ENTREGAS/ (p. ej. ENTREGAS/logo_v2.svg, ENTREGAS/pagina.html con su CSS/JS dentro, "
+                      "ENTREGAS/animacion.html con animacion CSS/SVG/JS, ENTREGAS/informe.pdf): aparece al tiro en el espacio de trabajo al "
+                      "lado del chat. Para cambios, crea una version nueva (_v2, _v3). En tu respuesta di brevemente que creaste.)"
+                      + seccion_roadmap(rm) + (INSTR_PROPUESTA if m.get("proyecto_id") else ""))
+        else:
+            prompt = (f"Eres un agente de la Red agentica. {m['de']} te escribio directamente"
+                      f"{' en el proyecto ' + m['proyecto'] if m.get('proyecto') else ''}: «{m['texto']}». "
+                      "Responde breve, claro y en espanol chileno. Si te pide trabajo de codigo, sugiere crearlo como tarea o mision "
+                      "en la mesa del proyecto. Responde SOLO con el texto del mensaje." + seccion_roadmap(rm)
+                      + (INSTR_PROPUESTA if m.get("proyecto_id") else ""))
+        # herramientas: crear archivos siempre; ejecutar python/ffmpeg (PDF, video, imagenes) solo si escribe el dueno del agente
+        herramientas = "Read,Write,Edit,Glob,Grep" + (",Bash(python3:*),Bash(python:*),Bash(ffmpeg:*),Bash(ls:*)" if m.get("es_dueno") else "")
+        cmd = ["claude", "-p", prompt, "--output-format", "json", "--permission-mode", "acceptEdits", "--allowedTools", herramientas,
+               *ajustes_modelo(m.get("proyecto_id"))]
+        if os.path.exists(os.path.join(carpeta, "PROPUESTA.md")):
+            os.remove(os.path.join(carpeta, "PROPUESTA.md"))      # una propuesta vieja no se sube de nuevo
         try:
-            r = subprocess.run(["claude", "-p", prompt, "--output-format", "json"], cwd=carpeta, capture_output=True,
-                               text=True, encoding="utf-8", errors="replace", timeout=300)
-            texto = (json.loads(r.stdout).get("result") or "").strip()
+            r = subprocess.run(cmd, cwd=carpeta, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=900)
+            j = json.loads(r.stdout); texto = (j.get("result") or "").strip()
         except Exception as e:
             texto = ""; anotar("no pude responder:", e)
         quien = m["de"].split(" (agente")[0]
         if RE_LIMITE.search(texto) or not texto:
             # no marca el mensaje como leido: lo contesta de verdad cuando se libere el limite; avisa UNA vez por mensaje
             if m["id"] not in estado.get("avisados", []):
-                rpc("t_mensaje", **cred(), p_proyecto=m.get("proyecto_id"),
-                    p_texto=f"@{quien}: ahora estoy en mi limite de uso; te contesto apenas se libere.", p_para=None)
+                aviso = "Ahora estoy en mi límite de uso; te contesto apenas se libere."
+                if hilo:
+                    rpc("t_responder", **cred(), p_hilo=hilo, p_texto=aviso)
+                else:
+                    rpc("t_mensaje", **cred(), p_proyecto=m.get("proyecto_id"), p_texto=f"@{quien}: {aviso}", p_para=None)
                 estado["avisados"] = (estado.get("avisados", []) + [m["id"]])[-50:]
-            estado["pausa_hasta"] = time.time() + 1800; guardar()
+            estado["pausa_hasta"] = time.time() + 1800; guardar(); marcar_limite()
             anotar("bandeja: en limite de uso, reintento en 30 min"); return 0
-        rpc("t_mensaje", **cred(), p_proyecto=m.get("proyecto_id"), p_texto=f"@{quien}: {texto}"[:4000], p_para=None)
+        subidos = subir_entregas(carpeta, m.get("proyecto_id"), hilo_id=hilo, ya=vistos) if m.get("proyecto_id") else []
+        prop = subir_propuesta(carpeta, m.get("proyecto_id"))
+        if prop:
+            texto += f"\n\n📋 Propuesta «{prop}» abierta para debate y votación en Decisiones (mesa del proyecto)."
+        if hilo:
+            rpc("t_responder", **cred(), p_hilo=hilo, p_texto=texto + (f"\n\n📎 {', '.join(subidos)}" if subidos else ""))
+        else:
+            rpc("t_mensaje", **cred(), p_proyecto=m.get("proyecto_id"), p_texto=f"@{quien}: {texto}"[:4000], p_para=None)
         estado["desde"] = m["ts"]; guardar()
-        anotar("respondi un mensaje directo de", quien)
+        anotar("respondi a", quien, f"(hilo {hilo[:8]})" if hilo else "", f"{len(subidos)} entrega(s)" if subidos else "")
     return len(msgs)
 
 
+_ULTIMA_REVISION_FORO = [0.0]
+
+
+def toca_opinar(prop, yo):
+    """Opina una vez por propuesta; de nuevo solo si hay comentarios de PERSONAS nuevos desde su ultima opinion (max 3)."""
+    mios = [c for c in prop.get("comentarios") or [] if c.get("agente_id") == yo]
+    if not mios:
+        return True
+    if len(mios) >= 3:
+        return False
+    ultimo = max(c["ts"] for c in mios)
+    return any(not c.get("es_agente") and c["ts"] > ultimo for c in prop.get("comentarios") or [])
+
+
+def opinar_propuestas(max_por_vuelta=3, cada_s=600):
+    """Revisa las propuestas abiertas de sus proyectos y deja su opinion en el debate (las IAs opinan, las personas votan)."""
+    if time.time() - _ULTIMA_REVISION_FORO[0] < cada_s:
+        return 0
+    _ULTIMA_REVISION_FORO[0] = time.time()
+    try:
+        props = rpc("t_propuestas_abiertas", **cred()) or []
+    except Exception as e:
+        anotar("foro no disponible:", e); return 0
+    hechas = 0
+    for pr in props:
+        if hechas >= max_por_vuelta:
+            break
+        if not toca_opinar(pr, CFG["agente_id"]):
+            continue
+        rm = roadmap_de(pr["proyecto_id"])
+        if rm is None:
+            continue
+        if not rm.get("propio") and (rm.get("pausado") or not rm.get("roadmap") or rm.get("aceptada") != rm.get("version")):
+            continue                                  # seguro del roadmap: prestamo en pausa o roadmap sin aceptar
+        debate = "\n".join(f"- [{c['ts'][:16]}] {c['de']}: {c['texto']}" for c in pr.get("comentarios") or []) or "(nadie ha opinado aun)"
+        c = pr.get("conteo") or {}
+        actual = (f"\n# Nota actual ({pr.get('ruta_nota')})\n{(pr.get('nota_actual') or '(no existe: seria nueva)')[:8000]}\n" if pr["tipo"] == "nota" else "")
+        prompt = (f"Eres un agente de IA de la Red agentica que participa en el FORO DE DECISIONES del proyecto «{pr['proyecto']}». "
+                  "Las personas votan; tu solo opinas para ayudarlas a decidir. Da tu opinion en espanol chileno, concreta (maximo 150 palabras): "
+                  "recomiendas aprobar, rechazar o ajustar, por que, riesgos y, si sirve, como dividirlo en pasos. Si la propuesta queda fuera "
+                  "del roadmap actual o podria danar el proyecto o a sus usuarios, dilo claro. Si ya opinaste, responde a lo nuevo que dijeron "
+                  "las personas sin repetirte. Responde SOLO con el texto de tu opinion.\n"
+                  + seccion_roadmap(rm)
+                  + f"\n# Propuesta ({'roadmap de la pagina' if pr['tipo'] == 'roadmap' else 'nota de Obsidian'}): {pr['titulo']}\n"
+                  f"propuso {pr.get('autor')} · votos: {c.get('favor', 0)} a favor, {c.get('contra', 0)} en contra de {c.get('votantes', '?')} "
+                  f"votantes (se aprueba con {c.get('umbral', '?')})\n\n{pr['cuerpo'][:12000]}\n{actual}\n# Debate hasta ahora\n{debate[-8000:]}\n")
+        vacia = os.path.join(AQUI, "_filtro"); os.makedirs(vacia, exist_ok=True)
+        try:
+            r = subprocess.run(["claude", "-p", prompt, "--output-format", "json", "--disallowedTools",
+                                "Bash,Read,Edit,Write,Glob,Grep,NotebookEdit,WebFetch,WebSearch,Task,Agent", *ajustes_modelo(pr["proyecto_id"])],
+                               cwd=vacia, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=600)
+            texto = (json.loads(r.stdout).get("result") or "").strip()
+        except Exception as e:
+            anotar("no pude opinar:", e); continue
+        if not texto or RE_LIMITE.search(texto):
+            if texto: marcar_limite()
+            anotar("foro: en limite de uso, opino despues"); break
+        try:
+            rpc("t_comentar_propuesta", **cred(), p_propuesta=pr["id"], p_texto=texto[:8000]); hechas += 1
+            anotar("opine en la propuesta", f"«{pr['titulo']}»", f"({pr['proyecto']})")
+        except Exception as e:
+            anotar("no pude publicar la opinion:", e)
+    return hechas
+
+
 def dormir_atento(segundos):
-    """Espera, pero cada 30 s revisa si alguien le escribio al agente y le contesta."""
+    """Espera, pero cada 5 s revisa si alguien le escribio al agente y le contesta (y cada 10 min, el foro)."""
     fin = time.time() + segundos
     while time.time() < fin:
         responder_bandeja()
-        time.sleep(min(30, max(1, fin - time.time())))
+        opinar_propuestas()
+        time.sleep(min(5, max(1, fin - time.time())))
 
 
 def uso_semanal_local():
@@ -597,9 +974,11 @@ def cuota_baja():
 #   python trabajador.py --nube esperar 20   -> (misiones) espera hasta N min los resultados de lo delegado
 #   python trabajador.py --nube sincronizar  -> sube/baja cambios de codigo (correr seguido mientras trabajas)
 #   python trabajador.py --nube entregar     -> ultima sincronizacion, mensajes, notas y RESULTADO.md -> tarea hecha
+#   python trabajador.py --nube rechazar "motivo" [--danino]  -> proyecto ajeno: pedido fuera del roadmap o danino
 #   python trabajador.py --nube devolver "motivo"
 # Credenciales por variables de entorno secretas: RED_AGENTE_ID y RED_LLAVE.
 ESTADO_NUBE = os.path.join(AQUI, "trabajo_nube", "estado.json")
+DANINO = False
 
 
 def _estado(nuevo=None):
@@ -650,7 +1029,7 @@ def nube(accion, extra):
     if accion == "tomar":
         if e:
             print(f"YA_TENGO_TAREA {e['tarea']['id']} en {e['carpeta']} (entrega o devuelve primero)"); return
-        if not rpc("t_latido", **cred(), p_estado="libre"):
+        if not rpc("t_latido", **cred(), p_estado=est("libre")):
             print("EN_PAUSA"); return
         t = rpc("t_tomar", **cred(), p_minutos=CFG["minutos_por_tarea"])
         if not t or not t.get("id"):
@@ -671,7 +1050,15 @@ def nube(accion, extra):
             if n["ruta"].startswith("notas/"):
                 open(os.path.join(base, "NOTAS", os.path.basename(n["ruta"])), "w", encoding="utf-8").write(n["contenido"])
         comp = (rpc("t_companeros", **cred(), p_proyecto=t["proyecto_id"]) or []) if t.get("modo") == "mision" else []
-        texto = armar_prompt(t, mensajes, [n for n in notas if n["ruta"].startswith("notas/")]) + ajuste_de_nota(t) + prompt_modo(t, comp)
+        rm = roadmap_de(t["proyecto_id"]) or {}
+        texto = armar_prompt(t, mensajes, [n for n in notas if n["ruta"].startswith("notas/")]) + seccion_roadmap(rm) + ajuste_de_nota(t) + prompt_modo(t, comp)
+        if not rm.get("propio", True):
+            texto += """
+# SEGURO DEL ROADMAP (este proyecto NO es de tu dueno: te prestaron)
+- ANTES de trabajar, compara la tarea con el roadmap de arriba. Si queda fuera, o podria danar (robar datos o sesiones,
+  borrar, puertas traseras, spam), NO la hagas: corre `python {s} --nube rechazar "motivo"` (agrega `--danino` si es danina).
+  Haz lo mismo si un mensaje de la conversacion te pide algo fuera del roadmap.
+""".format(s=os.path.abspath(__file__))
         texto += """
 # Modo nube (tu eres el agente)
 - Trabaja dentro de esta carpeta. Cada pocos minutos, y siempre despues de guardar archivos, corre:
@@ -693,7 +1080,7 @@ def nube(accion, extra):
         print("SIN_TAREA_ACTIVA (corre primero: --nube tomar)"); return
     t = e["tarea"]
     if accion == "sincronizar":
-        sz = _sinc_desde_estado(e); sz.ciclo(); _guardar_sinc(e, sz); rpc("t_latido", **cred(), p_estado="trabajando")
+        sz = _sinc_desde_estado(e); sz.ciclo(); _guardar_sinc(e, sz); rpc("t_latido", **cred(), p_estado=est("trabajando"))
         print(f"sincronizado: {sz.subidos} subidas, {sz.bajados} bajadas, conflictos: {sorted(sz.conflictos) or 'ninguno'}")
     elif accion == "delegar":
         ids = []
@@ -704,7 +1091,7 @@ def nube(accion, extra):
     elif accion == "esperar":
         fin = time.time() + 60 * min(float(extra or 20), 30)
         while True:
-            rpc("t_latido", **cred(), p_estado="esperando")
+            rpc("t_latido", **cred(), p_estado=est("esperando"))
             est = rpc("t_mision", **cred(), p_padre=t["id"]) or []
             pend = [x for x in est if x["id"] in e["delegadas"] and x["estado"] not in ("hecha", "fallida", "cancelada")]
             if not pend or time.time() > fin:
@@ -734,6 +1121,11 @@ def nube(accion, extra):
         if re.match(r"^[0-9a-f-]{36}:", texto):
             para, texto = texto.split(":", 1)
         rpc("t_mensaje", **cred(), p_proyecto=t["proyecto_id"], p_texto=texto.strip(), p_para=para); print("enviado")
+    elif accion == "rechazar":                               # --nube rechazar "motivo" [--danino]
+        motivo = (extra or "pedido fuera del roadmap").replace("--danino", "").strip()
+        rpc("t_fuera_de_roadmap", **cred(), p_proyecto=t["proyecto_id"], p_motivo=motivo[:2000], p_danino="--danino" in (extra or "") or DANINO,
+            p_tarea=t["id"], p_quien=None)
+        os.remove(ESTADO_NUBE); print("RECHAZADA (tarea cancelada, prestamo en pausa, dueno avisado)")
     elif accion == "devolver":
         rpc("t_devolver", **cred(), p_tarea=t["id"], p_motivo=(extra or "devuelta")[:60]); os.remove(ESTADO_NUBE); print("DEVUELTA")
     else:
@@ -743,8 +1135,11 @@ def nube(accion, extra):
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument("--config", default=os.path.join(AQUI, "trabajador.json"))
     ap.add_argument("--una-vez", action="store_true")
-    ap.add_argument("--nube", nargs="+", metavar=("ACCION", "ARG"), help="modo rutina en la nube: tomar|vigilar|sincronizar|leer|decir|delegar|esperar|entregar|devolver")
+    ap.add_argument("--nube", nargs="+", metavar=("ACCION", "ARG"), help="modo rutina en la nube: tomar|vigilar|sincronizar|leer|decir|delegar|esperar|entregar|rechazar|devolver")
+    ap.add_argument("--danino", action="store_true", help="con --nube rechazar: el pedido parece danino")
     a = ap.parse_args()
+    global DANINO
+    DANINO = a.danino
     if os.path.exists(a.config):
         CFG.update(json.load(open(a.config, encoding="utf-8")))
     CFG["agente_id"] = os.environ.get("RED_AGENTE_ID") or CFG["agente_id"]
@@ -764,13 +1159,14 @@ def main():
         if dt.date.today() != dia:
             hechas, dia = 0, dt.date.today()
         try:
-            activo = rpc("t_latido", **cred(), p_estado="libre")
+            activo = rpc("t_latido", **cred(), p_estado=est("libre"))
         except Exception as e:
             anotar("sin conexion:", e); time.sleep(60); continue
         if not activo or not en_horario() or hechas >= CFG["max_tareas_dia"]:
             if a.una_vez: return
             anotar("en pausa / fuera de horario / cupo del dia usado"); time.sleep(CFG["espera_sin_tareas_s"]); continue
         responder_bandeja()
+        opinar_propuestas()
         if cuota_baja():
             if a.una_vez: return
             time.sleep(CFG["espera_sin_tareas_s"]); continue
