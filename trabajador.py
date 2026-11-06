@@ -27,12 +27,34 @@ CFG = {
     "claude_args": ["--permission-mode", "acceptEdits",
                     "--allowedTools", "Read,Edit,Write,Glob,Grep,Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(graphify query:*),Bash(graphify explain:*),Bash(graphify path:*)"],
 }
-RE_LIMITE = re.compile(r"usage limit|rate limit|limit reached|5-hour limit|weekly limit|limite de uso", re.I)
+RE_LIMITE = re.compile(r"usage limit|rate limit|limit reached|5-hour limit|weekly limit|hit your .{0,20}limit|limite de uso", re.I)
 LIMITE_HASTA = 0.0   # mientras Claude este en su limite de uso, el latido dice "limite_uso" (la pagina lo muestra "sin creditos")
 
 
 def est(estado):
     return "limite_uso" if time.time() < LIMITE_HASTA else estado
+
+
+ULTIMA_PRUEBA = 0.0
+
+
+def probar_cupo(forzar=False):
+    """Cada 30 min (o al empezar) hace una pregunta minima a Claude (haiku) para saber si la cuenta tiene creditos,
+    aunque no haya tareas: asi la pagina muestra "sin creditos" en vez de "en linea". Sin creditos no gasta nada."""
+    global LIMITE_HASTA, ULTIMA_PRUEBA
+    if not forzar and time.time() - ULTIMA_PRUEBA < CFG.get("probar_cupo_s", 1800):
+        return
+    ULTIMA_PRUEBA = time.time()
+    try:
+        r = subprocess.run(["claude", "-p", "Responde solo: ok", "--model", "haiku", "--output-format", "text"],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180)
+    except Exception as e:
+        anotar("prueba de cupo fallo:", e); return
+    if RE_LIMITE.search((r.stdout or "") + (r.stderr or "")):
+        marcar_limite(); anotar("prueba de cupo: sin creditos (limite de uso)")
+    elif r.returncode == 0 and (r.stdout or "").strip():
+        if LIMITE_HASTA: anotar("prueba de cupo: volvieron los creditos")
+        LIMITE_HASTA = 0.0
 
 
 def marcar_limite():
@@ -1165,6 +1187,11 @@ def main():
         if not activo or not en_horario() or hechas >= CFG["max_tareas_dia"]:
             if a.una_vez: return
             anotar("en pausa / fuera de horario / cupo del dia usado"); time.sleep(CFG["espera_sin_tareas_s"]); continue
+        probar_cupo()
+        if time.time() < LIMITE_HASTA:
+            rpc("t_latido", **cred(), p_estado="limite_uso")
+            if a.una_vez: return
+            time.sleep(min(CFG["espera_sin_tareas_s"], 300)); continue
         responder_bandeja()
         opinar_propuestas()
         if cuota_baja():
