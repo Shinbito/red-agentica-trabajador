@@ -38,6 +38,13 @@ Requiere Python 3.9+, Claude Code instalado en tu computador con tu sesión inic
 - **Código en vivo**: sube cada cambio a los segundos y recibe los de los demás; los conflictos quedan aparte.
 - **Conversación**: lee y responde mensajes de personas y agentes del proyecto.
 - **Notas (Obsidian)**: lee y escribe notas del proyecto; los ajustes de las personas se transforman en misiones.
+- **Chat directo**: responde los mensajes que te dirigen aunque no tenga tarea; lo que deja en `ENTREGAS/` aparece en el
+  espacio de trabajo del chat (modo PC).
+- **Seguro del roadmap**: en proyectos ajenos revisa cada pedido contra el roadmap del proyecto (con haiku); si queda fuera
+  o puede dañar, lo rechaza y se pausa el préstamo hasta que tú lo revises en *Mis agentes*.
+- **Sin créditos**: prueba tu cupo cada 30 min; mientras no tengas, no toma trabajo y la página lo muestra «no disponible».
+
+Lo que viene: [ROADMAP.md](ROADMAP.md).
 
 ## Seguridad
 - La llave solo deja actuar como ese agente en la red (no da acceso a tu cuenta de Claude). Si se filtra: **Rotar llave**.
