@@ -13,6 +13,10 @@ público es su copia para que cualquiera lo descargue o lo use desde una rutina 
 - [x] **Conversación y notas (Obsidian)** del proyecto; `MENSAJES.txt` para hablar con todos o con un agente.
 - [x] **Chat directo con hilos**: responde mensajes dirigidos al agente aunque no tenga tarea, `--resume` por hilo,
   resumen de hilos largos con haiku, y sube `ENTREGAS/` al espacio de trabajo del chat (modo PC).
+- [x] **Entregas en modo nube** (06-11-2026): `--nube entregar` sube `ENTREGAS/` igual que el modo PC (`subir_entregas`,
+  con la tarea) y las anota en el resultado; si el dominio del servidor de archivos no está permitido, la tarea se entrega
+  igual y sale `AVISO_ENTREGAS` con qué permitir. Arreglado también un error que rompía `--nube tomar|vigilar|sincronizar|
+  esperar` (la variable `est` tapaba la función del mismo nombre).
 - [x] **Seguro del roadmap**: en proyectos ajenos revisa el pedido contra el roadmap con `claude -p --model haiku`
   (sin herramientas, carpeta vacía `_filtro/`); si queda fuera o es dañino → `t_fuera_de_roadmap` (pausa el préstamo y
   avisa). Sin roadmap escrito, un agente ajeno no trabaja. Copia local en `roadmaps/<proyecto>.md`.
@@ -21,9 +25,9 @@ público es su copia para que cualquiera lo descargue o lo use desde una rutina 
 - [x] graphify opcional para mantener el mapa del código de cada proyecto (solo AST, sin gastar tokens).
 
 ## Pendientes
-1. **Entregas en modo nube**: hoy `subir_entregas` solo corre en modo PC. Para la nube habría que llamarla en
-   `--nube entregar` y documentar en `LEEME.md` que el entorno permita también el dominio de la página (Network access y
-   network secret con `x-red-llave`).
+1. ~~Entregas en modo nube~~ — hecho el 06-11-2026 (ver arriba). Falta copiar este `trabajador.py` al repo de la red
+   (`trabajador/trabajador.py`) y a `sitio/descargas/`, y que los entornos de nube ya creados agreguen
+   `srv1727399.hstgr.cloud` (Network access + network secret).
 2. **Quién pide en el chat sin hilo**: la bandeja no devuelve el uuid de quien escribe, así que el aviso
    `fuera_de_roadmap` va con `pidio` vacío. Requiere cambio en la base (RPC `t_bandeja`), no solo en el trabajador.
 3. **Actualizar los trabajadores ya instalados** (los 24/7 del servidor y los PC de amigos) a esta versión: lo hace el

@@ -9,7 +9,7 @@ Uso:  python trabajador.py               (lee trabajador.json junto al script)
 Solo biblioteca estandar. Requiere `claude` (Claude Code) instalado y con sesion iniciada, y `git` si los proyectos
 tienen repo. Opcional: graphify (`pip install graphifyy`) para mantener el mapa del codigo.
 """
-import argparse, datetime as dt, json, os, re, shutil, subprocess, sys, threading, time, urllib.request, urllib.error
+import argparse, datetime as dt, json, os, re, shutil, subprocess, sys, threading, time, urllib.parse, urllib.request, urllib.error
 
 AQUI = os.path.dirname(os.path.abspath(__file__))
 CFG = {
@@ -676,8 +676,9 @@ TIPOS_ENTREGA = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg
                  ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", ".glb": "model/gltf-binary"}
 
 
-def subir_entregas(carpeta, proyecto_id, tarea_id=None, hilo_id=None, ya=None):
-    """Sube al espacio de trabajo (servidor de archivos del VPS) lo nuevo o cambiado en ENTREGAS/. Devuelve los nombres subidos."""
+def subir_entregas(carpeta, proyecto_id, tarea_id=None, hilo_id=None, ya=None, fallos=None):
+    """Sube al espacio de trabajo (servidor de archivos del VPS) lo nuevo o cambiado en ENTREGAS/. Devuelve los nombres subidos.
+    Si se pasa la lista `fallos`, agrega ahi (nombre, error) de lo que no se pudo subir."""
     ya = ya if ya is not None else {}
     d = os.path.join(carpeta, "ENTREGAS")
     subidos = []
@@ -696,6 +697,8 @@ def subir_entregas(carpeta, proyecto_id, tarea_id=None, hilo_id=None, ya=None):
                 urllib.request.urlopen(req, timeout=300).read(); ya[rel] = firma_local; subidos.append(rel)
             except Exception as e:
                 anotar("no pude subir la entrega", rel, e)
+                if fallos is not None:
+                    fallos.append((rel, e))
     return subidos
 
 
@@ -1021,6 +1024,17 @@ def _guardar_sinc(e, sz):
     e.update(ver=sz.ver, sync=sz.sync, desde=sz.desde); _estado(e)
 
 
+def aviso_entregas_nube(fallos):
+    """Texto claro cuando la nube no pudo subir ENTREGAS/ (casi siempre: dominio del servidor de archivos no permitido)."""
+    dominio = urllib.parse.urlparse(ARCHIVOS).hostname
+    lineas = [f"AVISO_ENTREGAS: {len(fallos)} archivo(s) de ENTREGAS/ no se subieron (la tarea SI quedo entregada):"]
+    lineas += [f"  - {rel}: {str(err)[:200]}" for rel, err in fallos]
+    lineas += [f"  Lo mas probable: el entorno de la nube no permite {dominio}. En el entorno de la rutina agrega",
+               f"  {dominio} en Network access y en el network secret (cabecera x-red-llave), igual que el dominio de Supabase.",
+               "  Mientras tanto, describe o pega lo importante en RESULTADO.md o en un mensaje."]
+    return "\n".join(lineas)
+
+
 def nube(accion, extra):
     e = _estado()
     if accion == "vigilar":   # espera barata (un solo comando): sin tarea -> toma la proxima; con tarea -> avisa mensajes/cambios nuevos
@@ -1060,6 +1074,7 @@ def nube(accion, extra):
         repo = (t.get("config") or {}).get("repo_url")
         if repo:
             subprocess.run(["git", "clone", "--depth", "50", repo, base], capture_output=True, text=True)
+        os.makedirs(os.path.join(base, "ENTREGAS"), exist_ok=True)
         sz = Sincronizador(base, t["proyecto_id"], t["id"])
         try:
             sz.iniciar()
@@ -1087,7 +1102,8 @@ def nube(accion, extra):
   `python {s} --nube sincronizar`  (comparte tu codigo en vivo y trae el de los demas).
 - Mision: escribe SUBTAREAS.json, corre `python {s} --nube delegar` y luego `python {s} --nube esperar 20`
   (puedes repetir esperar). Integra los resultados que imprime.
-- Al terminar: RESULTADO.md (+ MENSAJES.txt y NOTAS/ si aplica) y `python {s} --nube entregar`.
+- Al terminar: RESULTADO.md (+ MENSAJES.txt, NOTAS/ y ENTREGAS/ si aplica) y `python {s} --nube entregar`.
+  Lo que dejes en ENTREGAS/ se sube al espacio de trabajo; si sale AVISO_ENTREGAS, cuentalo en un mensaje.
 - CONVERSACION EN VIVO: `python {s} --nube leer` trae los mensajes nuevos (personas y otros agentes);
   `python {s} --nube decir "texto"` (o `"<id_agente>: texto"`) responde al tiro. Lee al empezar, cada vez que sincronices
   y antes de entregar; si te preguntan algo, contesta.
@@ -1114,12 +1130,12 @@ def nube(accion, extra):
         fin = time.time() + 60 * min(float(extra or 20), 30)
         while True:
             rpc("t_latido", **cred(), p_estado=est("esperando"))
-            est = rpc("t_mision", **cred(), p_padre=t["id"]) or []
-            pend = [x for x in est if x["id"] in e["delegadas"] and x["estado"] not in ("hecha", "fallida", "cancelada")]
+            filas = rpc("t_mision", **cred(), p_padre=t["id"]) or []
+            pend = [x for x in filas if x["id"] in e["delegadas"] and x["estado"] not in ("hecha", "fallida", "cancelada")]
             if not pend or time.time() > fin:
                 break
             time.sleep(30)
-        for x in est:
+        for x in filas:
             print(f"## {x['titulo']} [{x['modo']}] -> {x['estado']} ({x['agente'] or 'sin tomar'})\n{(x['resultado'] or '')[:6000]}\n")
         print(f"PENDIENTES {len(pend)}")
     elif accion == "entregar":
@@ -1128,8 +1144,16 @@ def nube(accion, extra):
         subir_conocimiento(e["carpeta"], t["proyecto_id"], e.get("notas", {}))
         f = os.path.join(e["carpeta"], "RESULTADO.md")
         resultado = open(f, encoding="utf-8", errors="replace").read() if os.path.exists(f) else "(sin RESULTADO.md)"
+        fallos = []
+        entregados = subir_entregas(e["carpeta"], t["proyecto_id"], tarea_id=t["id"], fallos=fallos)
+        if entregados:
+            resultado += "\n\n📎 Entregas: " + ", ".join(entregados)
+        if fallos:
+            resultado += f"\n\n⚠️ {len(fallos)} entrega(s) no se pudieron subir desde la nube: " + ", ".join(r for r, _ in fallos)
         rpc("t_terminar", **cred(), p_tarea=t["id"], p_ok=os.path.exists(f), p_resultado=resultado)
-        os.remove(ESTADO_NUBE); print(f"ENTREGADA ({n} mensajes, {sz.subidos} archivos subidos)")
+        os.remove(ESTADO_NUBE); print(f"ENTREGADA ({n} mensajes, {sz.subidos} archivos subidos, {len(entregados)} entrega(s) al espacio de trabajo)")
+        if fallos:
+            print(aviso_entregas_nube(fallos))
     elif accion == "leer":                                   # mensajes nuevos del proyecto (y su mesa) desde la ultima lectura
         desde = e.get("leido_hasta") or (dt.datetime.utcnow() - dt.timedelta(hours=2)).isoformat() + "Z"
         ms = rpc("t_mensajes", **cred(), p_proyecto=t["proyecto_id"], p_desde=desde, p_max=50) or []
