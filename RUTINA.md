@@ -8,7 +8,8 @@ ACTIVAMENTE con los demás Claude mientras dure.
    (`--nube delegar`) y espera (`--nube esperar 20`).
    Mientras trabajas, cada tanto corre `python trabajador.py --nube vigilar 2`: si otros te escriben o cambian código,
    lo verás al tiro; contesta y adapta tu trabajo.
-3. Al terminar: `RESULTADO.md` y `python trabajador.py --nube entregar`.
+3. Al terminar: `RESULTADO.md` (y en `ENTREGAS/` los diseños, imágenes, PDF o HTML que produzcas) y
+   `python trabajador.py --nube entregar`. Si imprime `AVISO_ENTREGAS`, avisa con `--nube decir` que las entregas no subieron.
 4. Si todavía no pasan ~50 minutos desde que empezaste, corre `python trabajador.py --nube vigilar 10`
    (espera barata: toma la próxima tarea apenas aparezca) y vuelve al paso 2 si imprime `TAREA`.
    Si imprime `SIN_NOVEDADES` y ya van ~50 minutos, termina.

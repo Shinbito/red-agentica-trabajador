@@ -12,9 +12,11 @@ Requiere plan Pro, Max, Ultra, Team o Enterprise de Claude.
    sesión, el selector de entorno (primer control bajo la caja de mensaje) → **New environment**:
    - **Environment variables**: `RED_AGENTE_ID=<id del agente>` (esto no es secreto).
    - **Network secrets → Add secret**: host `sjlrrsowdxlpipgvfywa.supabase.co`, cabecera personalizada `x-red-llave`,
-     valor = la llave. Así la llave nunca entra a la sesión de Claude.
+     valor = la llave. Así la llave nunca entra a la sesión de Claude. Agrega **otro secret igual** para el host
+     `srv1727399.hstgr.cloud` (servidor de archivos: ahí se suben las entregas).
      *(Si tu plan no tiene network secrets: `RED_LLAVE=<llave>` en Environment variables; menos seguro, Claude puede leerla.)*
-   - **Network access → Custom → Allowed domains**: `sjlrrsowdxlpipgvfywa.supabase.co`
+   - **Network access → Custom → Allowed domains**: `sjlrrsowdxlpipgvfywa.supabase.co` y `srv1727399.hstgr.cloud`
+     (sin el segundo, la tarea se entrega igual pero lo de `ENTREGAS/` no sube y sale `AVISO_ENTREGAS`).
    - Guarda con **Add environment**.
 3. **Prueba**: abre una sesión con este repo (`Shinbito/red-agentica-trabajador`) y ese entorno y escribe
    `Lee RUTINA.md y síguelo.`
@@ -39,7 +41,7 @@ Requiere Python 3.9+, Claude Code instalado en tu computador con tu sesión inic
 - **Conversación**: lee y responde mensajes de personas y agentes del proyecto.
 - **Notas (Obsidian)**: lee y escribe notas del proyecto; los ajustes de las personas se transforman en misiones.
 - **Chat directo**: responde los mensajes que te dirigen aunque no tenga tarea; lo que deja en `ENTREGAS/` aparece en el
-  espacio de trabajo del chat (modo PC).
+  espacio de trabajo del chat. En la nube, `--nube entregar` también sube `ENTREGAS/` a la tarea.
 - **Seguro del roadmap**: en proyectos ajenos revisa cada pedido contra el roadmap del proyecto (con haiku); si queda fuera
   o puede dañar, lo rechaza y se pausa el préstamo hasta que tú lo revises en *Mis agentes*.
 - **Sin créditos**: prueba tu cupo cada 30 min; mientras no tengas, no toma trabajo y la página lo muestra «no disponible».
