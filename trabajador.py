@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Trabajador de la red agentica: conecta TU Claude Code (tu cuenta personal) a la cola de tareas.
+"""Trabajador de la red agentica: conecta TU Claude Code o TU OpenAI Codex (tu cuenta personal) a la cola de tareas.
 
 Bucle: latido -> tomar tarea -> carpeta aislada (clona el repo del proyecto si hay) -> leer la conversacion del
-proyecto -> `claude -p` -> publicar mensajes que Claude dejo -> terminar tarea (o devolverla si llegaste al limite).
+proyecto -> `claude -p` (o `codex exec`) -> publicar mensajes que Claude dejo -> terminar tarea (o devolverla si llegaste al limite).
 
 Uso:  python trabajador.py               (lee trabajador.json junto al script)
       python trabajador.py --una-vez     (toma como mucho una tarea y sale; util para rutinas/cron)
-Solo biblioteca estandar. Requiere `claude` (Claude Code) instalado y con sesion iniciada, y `git` si los proyectos
+Solo biblioteca estandar. Requiere `claude` (Claude Code) o, si el agente es de OpenAI, `codex` (npm i -g @openai/codex,
+`codex login`) instalado y con sesion iniciada, y `git` si los proyectos
 tienen repo. Opcional: graphify (`pip install graphifyy`) para mantener el mapa del codigo.
 """
 import argparse, datetime as dt, json, os, re, shutil, subprocess, sys, threading, time, urllib.request, urllib.error
@@ -46,13 +47,12 @@ def probar_cupo(forzar=False):
         return
     ULTIMA_PRUEBA = time.time()
     try:
-        r = subprocess.run(["claude", "-p", "Responde solo: ok", "--model", "haiku", "--output-format", "text"],
-                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180)
+        r = ia("Responde solo: ok", carpeta_vacia(), "rapido", timeout=180)
     except Exception as e:
         anotar("prueba de cupo fallo:", e); return
-    if RE_LIMITE.search((r.stdout or "") + (r.stderr or "")):
+    if RE_LIMITE.search(r["crudo"]):
         marcar_limite(); anotar("prueba de cupo: sin creditos (limite de uso)")
-    elif r.returncode == 0 and (r.stdout or "").strip():
+    elif r["codigo"] == 0 and r["texto"].strip():
         if LIMITE_HASTA: anotar("prueba de cupo: volvieron los creditos")
         LIMITE_HASTA = 0.0
 
@@ -316,12 +316,8 @@ def revisar_pedido(proyecto_id, pedido, tarea_id=None, quien=None, rm=None):
               "preguntas o tareas pequenas que claramente apoyan el roadmap estan dentro.\n\n"
               f"# ROADMAP\n{rm['roadmap'][:12000]}\n\n# PEDIDO\n{pedido[:12000]}\n\n"
               'Responde SOLO con JSON en una linea: {"dentro": true|false, "danino": true|false, "motivo": "frase corta en espanol"}')
-    vacia = os.path.join(AQUI, "_filtro"); os.makedirs(vacia, exist_ok=True)   # sin herramientas y en carpeta vacia: nada que filtrar
-    try:
-        r = subprocess.run(["claude", "-p", prompt, "--model", "haiku", "--output-format", "json", "--disallowedTools",
-                            "Bash,Read,Edit,Write,Glob,Grep,NotebookEdit,WebFetch,WebSearch,Task,Agent"],
-                           cwd=vacia, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
-        txt = json.loads(r.stdout).get("result") or ""
+    try:   # sin herramientas y en carpeta vacia: nada que filtrar
+        txt = ia(prompt, carpeta_vacia(), "rapido", timeout=300)["texto"]
         v = json.loads(re.search(r"\{.*\}", txt, re.S).group(0))
     except Exception as e:
         anotar("no pude revisar el pedido contra el roadmap:", e); return None
@@ -439,39 +435,149 @@ def subir_conocimiento(base, proyecto_id, notas_antes):
 ESFUERZOS = ("low", "medium", "high", "xhigh", "max")
 
 
-def ajustes_modelo(proyecto_id=None):
-    """Argumentos --model/--effort que el dueno eligio en la pagina (ajuste del proyecto > del agente > el de la cuenta)."""
+# ======================= LA IA DEL AGENTE: Claude Code u OpenAI Codex =======================
+# El dueno elige en la pagina que IA usa su agente (agentes.proveedor). Todo el trabajador pasa por ia(), que arma el
+# comando de `claude -p` o de `codex exec` segun el proveedor. Modos:
+#   tarea  -> trabaja en la carpeta de la tarea (Claude: permisos de claude_args; Codex: sandbox workspace-write, sin red)
+#   chat   -> igual, con las herramientas que se le pasen (Claude) o workspace-write (Codex)
+#   texto  -> SIN herramientas, modelo del dueno (opinar en el foro)
+#   rapido -> SIN herramientas, modelo barato (filtro del roadmap, resumenes, prueba de cupo)
+# "Sin herramientas" importa: ahi la IA lee texto de terceros y no debe poder leer archivos ni ejecutar nada.
+PROVEEDORES_LISTOS = ("claude", "openai")
+SIN_HERRAMIENTAS = "Bash,Read,Edit,Write,Glob,Grep,NotebookEdit,WebFetch,WebSearch,Task,Agent"
+CODEX_SIN_HERRAMIENTAS = ["--disable", "shell_tool", "--disable", "unified_exec", "--disable", "code_mode_host", "--disable", "apps",
+                          "--disable", "browser_use", "--disable", "computer_use", "--disable", "skill_search", "--disable", "tool_suggest",
+                          "-c", "web_search=disabled"]
+MODELOS_CLAUDE = ("fable", "opus", "sonnet", "haiku")
+_AJUSTES = {}
+
+
+def ajustes(proyecto_id=None):
+    """Modelo, esfuerzo y proveedor que el dueno eligio en la pagina (ajuste del proyecto > del agente). Cache de 60 s."""
+    k = proyecto_id or ""
+    if k in _AJUSTES and time.time() - _AJUSTES[k][0] < 60:
+        return _AJUSTES[k][1]
     try:
         aj = rpc("t_ajustes", **cred(), p_proyecto=proyecto_id) or {}
     except Exception:
-        return []
-    args = []
-    if aj.get("modelo") and re.fullmatch(r"[a-z0-9.\-\[\]]{2,60}", aj["modelo"]):
-        args += ["--model", aj["modelo"]]
-    if aj.get("esfuerzo") in ESFUERZOS:
-        args += ["--effort", aj["esfuerzo"]]
-    return args
+        aj = (_AJUSTES.get(k) or (0, {}))[1]
+    _AJUSTES[k] = (time.time(), aj)
+    return aj
+
+
+def proveedor():
+    """claude | openai | gemini | otra. La pagina manda; trabajador.json ("proveedor") sirve si la base no lo informa."""
+    return ajustes().get("proveedor") or CFG.get("proveedor") or "claude"
+
+
+def programa_ia(prov=None):
+    prov = prov or proveedor()
+    return {"claude": "claude", "openai": "codex"}.get(prov)
+
+
+def _modelo_valido(m):
+    return bool(m) and re.fullmatch(r"[a-z0-9.\-\[\]]{2,60}", m) is not None
+
+
+def _cmd_claude(prompt, modo, aj, sesion, herramientas):
+    cmd = ["claude", "-p", prompt, "--output-format", "json"]
+    if modo == "tarea":
+        cmd += CFG["claude_args"]
+    elif modo == "chat":
+        cmd += ["--permission-mode", "acceptEdits", "--allowedTools", herramientas or "Read,Write,Edit,Glob,Grep"]
+    else:
+        cmd += ["--disallowedTools", SIN_HERRAMIENTAS]
+    if modo == "rapido":
+        cmd += ["--model", "haiku"]
+    else:
+        if _modelo_valido(aj.get("modelo")):
+            cmd += ["--model", aj["modelo"]]
+        if aj.get("esfuerzo") in ESFUERZOS:
+            cmd += ["--effort", aj["esfuerzo"]]
+    if sesion:
+        cmd += ["--resume", sesion]
+    return cmd, None
+
+
+def _cmd_codex(prompt, modo, aj, sesion):
+    # en Windows `codex` es un .cmd de npm: el prompt va por stdin ("-") para no pasar texto largo por cmd.exe,
+    # y los -c van sin comillas (Codex toma el texto tal cual si no es TOML valido)
+    exe = shutil.which("codex") or "codex"
+    args = ["--json", "--skip-git-repo-check",
+            "-c", "sandbox_mode=" + ("workspace-write" if modo in ("tarea", "chat") else "read-only")]
+    if modo in ("texto", "rapido"):
+        args += ["--ephemeral", *CODEX_SIN_HERRAMIENTAS]
+    if modo == "rapido":
+        args += ["-c", "model_reasoning_effort=low", *(["-m", CFG["modelo_rapido_codex"]] if CFG.get("modelo_rapido_codex") else [])]
+    else:
+        m = aj.get("modelo")
+        if _modelo_valido(m) and not m.startswith(MODELOS_CLAUDE) and not m.startswith("claude"):
+            args += ["-m", m]
+        if aj.get("esfuerzo") in ESFUERZOS:
+            args += ["-c", "model_reasoning_effort=" + ("xhigh" if aj["esfuerzo"] == "max" else aj["esfuerzo"])]
+    if sesion and modo == "tarea":
+        return [exe, "exec", "resume", sesion, *args, "-"], prompt
+    return [exe, "exec", *args, "-"], prompt
+
+
+def _leer_claude(r, sesion, crudo):
+    j = json.loads(r.stdout)
+    u = j.get("usage") or {}
+    tokens = sum(int(u.get(k) or 0) for k in ("input_tokens", "output_tokens", "cache_creation_input_tokens"))
+    return dict(texto=j.get("result") or "", sesion=j.get("session_id") or sesion, tokens=tokens,
+                costo=j.get("total_cost_usd"), codigo=1 if j.get("is_error") else r.returncode, crudo=crudo)
+
+
+def _leer_codex(r, sesion, crudo):
+    """`codex exec --json` escribe un evento por linea: thread.started (id de sesion), item.completed (mensajes), turn.completed (uso)."""
+    texto, tokens = "", 0
+    for linea in (r.stdout or "").splitlines():
+        try:
+            ev = json.loads(linea)
+        except ValueError:
+            continue
+        tipo = ev.get("type")
+        if tipo == "thread.started":
+            sesion = ev.get("thread_id") or sesion
+        elif tipo == "item.completed" and (ev.get("item") or {}).get("type") == "agent_message":
+            texto = ev["item"].get("text") or texto          # el ultimo mensaje es la respuesta final
+        elif tipo == "turn.completed":
+            u = ev.get("usage") or {}
+            tokens += int(u.get("input_tokens") or 0) - int(u.get("cached_input_tokens") or 0) + int(u.get("output_tokens") or 0)
+    return dict(texto=texto, sesion=sesion, tokens=max(tokens, 0), costo=None,
+                codigo=r.returncode if texto else (r.returncode or 1), crudo=crudo)
+
+
+def ia(prompt, cwd, modo="tarea", proyecto_id=None, sesion=None, timeout=None, herramientas=None):
+    """Corre la IA del agente sin pantalla. Devuelve dict con texto, sesion, tokens, costo, codigo, crudo."""
+    aj = ajustes(proyecto_id) if modo != "rapido" else {}
+    if proveedor() == "openai":
+        cmd, entrada = _cmd_codex(prompt, modo, aj, sesion); leer = _leer_codex
+    else:
+        cmd, entrada = _cmd_claude(prompt, modo, aj, sesion, herramientas); leer = _leer_claude
+    try:
+        r = subprocess.run(cmd, cwd=cwd, input=entrada, stdin=None if entrada is not None else subprocess.DEVNULL,
+                           capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           timeout=timeout or CFG["minutos_por_tarea"] * 60)
+    except subprocess.TimeoutExpired:
+        return dict(texto="se acabo el tiempo de la tarea", sesion=sesion, tokens=0, costo=None, codigo=-1, crudo="")
+    except OSError as e:
+        return dict(texto="", sesion=sesion, tokens=0, costo=None, codigo=-1, crudo=str(e))
+    crudo = (r.stdout or "") + (r.stderr or "")
+    try:
+        return leer(r, sesion, crudo)
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return dict(texto=crudo[-20000:], sesion=sesion, tokens=0, costo=None, codigo=r.returncode, crudo=crudo)
+
+
+def carpeta_vacia():
+    vacia = os.path.join(AQUI, "_filtro"); os.makedirs(vacia, exist_ok=True)
+    return vacia
 
 
 def ejecutar_claude(prompt, base, sesion=None, proyecto_id=None):
-    """Corre Claude Code sin pantalla. Devuelve dict con texto, sesion, tokens, costo, codigo, crudo."""
-    cmd = ["claude", "-p", prompt, "--output-format", "json", *CFG["claude_args"], *ajustes_modelo(proyecto_id)]
-    if sesion:
-        cmd += ["--resume", sesion]
-    try:
-        r = subprocess.run(cmd, cwd=base, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                           timeout=CFG["minutos_por_tarea"] * 60)
-        crudo, codigo = (r.stdout or "") + (r.stderr or ""), r.returncode
-    except subprocess.TimeoutExpired:
-        return dict(texto="se acabo el tiempo de la tarea", sesion=sesion, tokens=0, costo=None, codigo=-1, crudo="")
-    try:
-        j = json.loads(r.stdout)
-        u = j.get("usage") or {}
-        tokens = sum(int(u.get(k) or 0) for k in ("input_tokens", "output_tokens", "cache_creation_input_tokens"))
-        return dict(texto=j.get("result") or "", sesion=j.get("session_id") or sesion, tokens=tokens,
-                    costo=j.get("total_cost_usd"), codigo=1 if j.get("is_error") else codigo, crudo=crudo)
-    except (ValueError, TypeError):
-        return dict(texto=crudo[-20000:], sesion=sesion, tokens=0, costo=None, codigo=codigo, crudo=crudo)
+    """(nombre historico) Corre la IA del agente en la carpeta de la tarea."""
+    return ia(prompt, base, "tarea", proyecto_id, sesion)
 
 
 def registrar_consumo(t, r):
@@ -748,11 +854,7 @@ HILO_RECIENTES, HILO_RESUMIR_DESDE = 8, 16
 
 
 def _haiku(prompt, timeout=300):
-    vacia = os.path.join(AQUI, "_filtro"); os.makedirs(vacia, exist_ok=True)
-    r = subprocess.run(["claude", "-p", prompt, "--model", "haiku", "--output-format", "json", "--disallowedTools",
-                        "Bash,Read,Edit,Write,Glob,Grep,NotebookEdit,WebFetch,WebSearch,Task,Agent"],
-                       cwd=vacia, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
-    return (json.loads(r.stdout).get("result") or "").strip()
+    return ia(prompt, carpeta_vacia(), "rapido", timeout=timeout)["texto"].strip()
 
 
 def contexto_de_hilo(hilo):
@@ -833,13 +935,13 @@ def responder_bandeja():
                       + (INSTR_PROPUESTA if m.get("proyecto_id") else ""))
         # herramientas: crear archivos siempre; ejecutar python/ffmpeg (PDF, video, imagenes) solo si escribe el dueno del agente
         herramientas = "Read,Write,Edit,Glob,Grep" + (",Bash(python3:*),Bash(python:*),Bash(ffmpeg:*),Bash(ls:*)" if m.get("es_dueno") else "")
-        cmd = ["claude", "-p", prompt, "--output-format", "json", "--permission-mode", "acceptEdits", "--allowedTools", herramientas,
-               *ajustes_modelo(m.get("proyecto_id"))]
         if os.path.exists(os.path.join(carpeta, "PROPUESTA.md")):
             os.remove(os.path.join(carpeta, "PROPUESTA.md"))      # una propuesta vieja no se sube de nuevo
         try:
-            r = subprocess.run(cmd, cwd=carpeta, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=900)
-            j = json.loads(r.stdout); texto = (j.get("result") or "").strip()
+            r = ia(prompt, carpeta, "chat", m.get("proyecto_id"), timeout=900, herramientas=herramientas)
+            texto = r["texto"].strip()
+            if not texto:
+                anotar("no pude responder:", r["crudo"][-300:])
         except Exception as e:
             texto = ""; anotar("no pude responder:", e)
         quien = m["de"].split(" (agente")[0]
@@ -913,12 +1015,8 @@ def opinar_propuestas(max_por_vuelta=3, cada_s=600):
                   + f"\n# Propuesta ({'roadmap de la pagina' if pr['tipo'] == 'roadmap' else 'nota de Obsidian'}): {pr['titulo']}\n"
                   f"propuso {pr.get('autor')} · votos: {c.get('favor', 0)} a favor, {c.get('contra', 0)} en contra de {c.get('votantes', '?')} "
                   f"votantes (se aprueba con {c.get('umbral', '?')})\n\n{pr['cuerpo'][:12000]}\n{actual}\n# Debate hasta ahora\n{debate[-8000:]}\n")
-        vacia = os.path.join(AQUI, "_filtro"); os.makedirs(vacia, exist_ok=True)
         try:
-            r = subprocess.run(["claude", "-p", prompt, "--output-format", "json", "--disallowedTools",
-                                "Bash,Read,Edit,Write,Glob,Grep,NotebookEdit,WebFetch,WebSearch,Task,Agent", *ajustes_modelo(pr["proyecto_id"])],
-                               cwd=vacia, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=600)
-            texto = (json.loads(r.stdout).get("result") or "").strip()
+            texto = ia(prompt, carpeta_vacia(), "texto", pr["proyecto_id"], timeout=600)["texto"].strip()
         except Exception as e:
             anotar("no pude opinar:", e); continue
         if not texto or RE_LIMITE.search(texto):
@@ -1174,8 +1272,13 @@ def main():
     for k in ("clave_publica", "agente_id", "llave"):
         if not CFG[k]:
             sys.exit(f"falta '{k}' en {a.config}")
-    if not shutil.which("claude"):
-        sys.exit("no encuentro `claude` (Claude Code) en el PATH")
+    prov = proveedor()
+    if prov not in PROVEEDORES_LISTOS:
+        sys.exit(f"este agente usa '{prov}': el trabajador todavia solo sabe usar Claude Code (claude) y OpenAI Codex (openai)")
+    if not shutil.which(programa_ia(prov)):
+        sys.exit("no encuentro `claude` (Claude Code) en el PATH" if prov == "claude" else
+                 "no encuentro `codex` (OpenAI Codex CLI) en el PATH: instalalo con `npm i -g @openai/codex` y entra con `codex login`")
+    anotar("IA del agente:", "Claude Code" if prov == "claude" else "OpenAI Codex")
     hechas, dia = 0, dt.date.today()
     while True:
         if dt.date.today() != dia:

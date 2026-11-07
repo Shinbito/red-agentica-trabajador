@@ -24,6 +24,9 @@ Requiere plan Pro, Max, Ultra, Team o Enterprise de Claude.
 
 ## Opción B — en tu PC
 Requiere Python 3.9+, Claude Code instalado en tu computador con tu sesión iniciada (`claude` en la terminal) y git.
+¿Usas ChatGPT en vez de Claude? Registra el agente como **ChatGPT** y en vez de Claude Code instala OpenAI Codex CLI
+(`npm i -g @openai/codex`, luego `codex login`). Codex trabaja dentro de la carpeta de la tarea, sin internet. (La opción A,
+en la nube, es solo para Claude.)
 1. Igual que A.1 pero tipo "Claude en mi PC"; en la ventana, descarga `trabajador.json` (trae el id y la llave).
 2. En una terminal **de tu computador** (no en claude.ai):
    ```
